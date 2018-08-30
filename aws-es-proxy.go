@@ -2,12 +2,10 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,12 +14,17 @@ import (
 	"strings"
 	"time"
 
-	// log "github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+
 	uuid "github.com/satori/go.uuid"
 )
+
+// set a default global logger
+var logger = log.NewJSONLogger(os.Stderr)
 
 type requestStruct struct {
 	Requestid  string
@@ -52,6 +55,7 @@ type proxy struct {
 	fileRequest  *os.File
 	fileResponse *os.File
 	credentials  *credentials.Credentials
+	client       *http.Client
 }
 
 func newProxy(args ...interface{}) *proxy {
@@ -62,6 +66,15 @@ func newProxy(args ...interface{}) *proxy {
 		logtofile: args[3].(bool),
 		nosignreq: args[4].(bool),
 	}
+}
+
+var client = &http.Client{
+	CheckRedirect: noRedirect,
+	Timeout:       300 * time.Second,
+}
+
+func noRedirect(req *http.Request, via []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func (p *proxy) parseEndpoint() error {
@@ -111,7 +124,7 @@ func (p *proxy) getSigner() *v4.Signer {
 		sess := session.Must(session.NewSession())
 		credentials := sess.Config.Credentials
 		p.credentials = credentials
-		log.Println("Generated fresh AWS Credentials object")
+		level.Info(logger).Log("msg", "session expired, generated fresh aws credentials object")
 	}
 	return v4.NewSigner(p.credentials)
 }
@@ -119,11 +132,13 @@ func (p *proxy) getSigner() *v4.Signer {
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestStarted := time.Now()
 	dump, err := httputil.DumpRequest(r, true)
+
 	if err != nil {
-		log.Fatalln("error while dumping request. Error: ", err.Error())
+		level.Error(logger).Log("msg", "error while dumping request", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	defer r.Body.Close()
 
 	ep := *r.URL
@@ -131,9 +146,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ep.Scheme = p.scheme
 
 	req, err := http.NewRequest(r.Method, ep.String(), r.Body)
+
 	if err != nil {
-		log.Fatalln("error creating new request. ", err.Error())
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "error creating new request. ", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
@@ -149,10 +165,11 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		signer.Sign(req, payload, p.service, p.region, time.Now())
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
+
 	if err != nil {
-		log.Fatalln(err.Error())
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "BadGateway", "err", err.Error(), "request", req.URL.String())
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
@@ -172,7 +189,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Send response back to requesting client
 	body := bytes.Buffer{}
 	if _, err := io.Copy(&body, resp.Body); err != nil {
-		log.Fatalln(err.Error())
+		level.Error(logger).Log("msg", "something went wrong", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -199,58 +216,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if p.verbose {
-		if p.prettify {
-			var prettyBody bytes.Buffer
-			json.Indent(&prettyBody, []byte(query), "", "  ")
-			t := time.Now()
-
-			fmt.Println()
-			fmt.Println("========================")
-			fmt.Println(t.Format("2006/01/02 15:04:05"))
-			fmt.Println("Remote Address: ", r.RemoteAddr)
-			fmt.Println("Request URI: ", ep.RequestURI())
-			fmt.Println("Method: ", r.Method)
-			fmt.Println("Status: ", resp.StatusCode)
-			fmt.Printf("Took: %.3fs\n", requestEnded.Seconds())
-			fmt.Println("Body: ")
-			fmt.Println(string(prettyBody.Bytes()))
-		} else {
-			log.Printf(" -> %s; %s; %s; %s; %d; %.3fs\n",
-				r.Method, r.RemoteAddr,
-				ep.RequestURI(), query,
-				resp.StatusCode, requestEnded.Seconds())
-		}
+		level.Info(logger).Log("method", r.Method, "remoteAddress", r.RemoteAddr, "requestUri", ep.RequestURI(), "query", query, "status", resp.StatusCode, "timeElapsed", requestEnded.Seconds())
 	}
-
-	if p.logtofile {
-
-		requestID, _ := uuid.NewV4()
-
-		reqStruct := &requestStruct{
-			Requestid:  requestID.String(),
-			Datetime:   time.Now().Format("2006/01/02 15:04:05"),
-			Remoteaddr: r.RemoteAddr,
-			Requesturi: ep.RequestURI(),
-			Method:     r.Method,
-			Statuscode: resp.StatusCode,
-			Elapsed:    requestEnded.Seconds(),
-			Body:       query,
-		}
-
-		respStruct := &responseStruct{
-			Requestid: requestID.String(),
-			Body:      string(body.Bytes()),
-		}
-
-		y, _ := json.Marshal(reqStruct)
-		z, _ := json.Marshal(respStruct)
-		p.fileRequest.Write(y)
-		p.fileRequest.WriteString("\n")
-		p.fileResponse.Write(z)
-		p.fileResponse.WriteString("\n")
-
-	}
-
 }
 
 // Recent versions of ES/Kibana require
@@ -285,6 +252,11 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
+func init() {
+	// ensure global logger uses UTC timestamps
+	logger = log.With(logger, "timestamp", log.DefaultTimestampUTC)
+}
+
 func main() {
 
 	var (
@@ -299,19 +271,11 @@ func main() {
 		err           error
 	)
 
-	flag.StringVar(&endpoint, "endpoint", "", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
+	flag.StringVar(&endpoint, "endpoint", "http://localhost", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
 	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
-	flag.BoolVar(&verbose, "verbose", false, "Print user requests")
-	flag.BoolVar(&logtofile, "log-to-file", false, "Log user requests and ElasticSearch responses to files")
-	flag.BoolVar(&prettify, "pretty", false, "Prettify verbose and file output")
+	flag.BoolVar(&verbose, "verbose", true, "Print user requests")
 	flag.BoolVar(&nosignreq, "no-sign-reqs", false, "Disable AWS Signature v4")
 	flag.Parse()
-
-	if len(os.Args) < 3 {
-		fmt.Println("You need to specify Amazon ElasticSearch endpoint.")
-		fmt.Println("Please run with '-h' for a list of available arguments.")
-		os.Exit(1)
-	}
 
 	p := newProxy(
 		endpoint,
@@ -322,7 +286,7 @@ func main() {
 	)
 
 	if err = p.parseEndpoint(); err != nil {
-		log.Fatalln(err)
+		level.Error(logger).Log("msg", err)
 		os.Exit(1)
 	}
 
@@ -333,10 +297,12 @@ func main() {
 		responseFname := fmt.Sprintf("response-%s.log", u2.String())
 
 		if fileRequest, err = os.Create(requestFname); err != nil {
-			log.Fatalln(err.Error())
+			level.Error(logger).Log("msg", err.Error())
+			os.Exit(1) // go-kit/log doesn't have a level.Fatal so we're exiting with os.Exit(1)
 		}
 		if fileResponse, err = os.Create(responseFname); err != nil {
-			log.Fatalln(err.Error())
+			level.Error(logger).Log("msg", err.Error())
+			os.Exit(1) // go-kit/log doesn't have a level.Fatal so we're exiting with os.Exit(1)
 		}
 
 		defer fileRequest.Close()
@@ -347,6 +313,8 @@ func main() {
 
 	}
 
-	log.Printf("Listening on %s...\n", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, p))
+	level.Info(logger).Log("status", "starting")
+	level.Info(logger).Log("status", "started", "listening", listenAddress)
+	level.Error(logger).Log("status", "failed", "err", http.ListenAndServe(listenAddress, p))
+
 }
