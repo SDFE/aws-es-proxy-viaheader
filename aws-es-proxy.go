@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -43,28 +44,26 @@ type responseStruct struct {
 }
 
 type proxy struct {
-	scheme       string
-	host         string
-	region       string
-	service      string
-	endpoint     string
-	verbose      bool
-	prettify     bool
-	logtofile    bool
-	nosignreq    bool
-	fileRequest  *os.File
-	fileResponse *os.File
-	credentials  *credentials.Credentials
-	client       *http.Client
+	scheme         string
+	host           string
+	region         string
+	service        string
+	endpointHeader string
+	verbose        bool
+	prettify       bool
+	logtofile      bool
+	fileRequest    *os.File
+	fileResponse   *os.File
+	credentials    *credentials.Credentials
+	client         *http.Client
 }
 
 func newProxy(args ...interface{}) *proxy {
 	return &proxy{
-		endpoint:  args[0].(string),
-		verbose:   args[1].(bool),
-		prettify:  args[2].(bool),
-		logtofile: args[3].(bool),
-		nosignreq: args[4].(bool),
+		endpointHeader: args[0].(string),
+		verbose:        args[1].(bool),
+		prettify:       args[2].(bool),
+		logtofile:      args[3].(bool),
 	}
 }
 
@@ -77,13 +76,21 @@ func noRedirect(req *http.Request, via []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-func (p *proxy) parseEndpoint() error {
+type esSigningEndpoint struct {
+	scheme  string
+	host    string
+	region  string
+	service string
+}
+
+func parseESEndpoint(endpoint string) (*esSigningEndpoint, error) {
 	var link *url.URL
 	var err error
+	signingEnpoint := esSigningEndpoint{}
 
-	if link, err = url.Parse(p.endpoint); err != nil {
-		return fmt.Errorf("error: failure while parsing endpoint: %s. Error: %s",
-			p.endpoint, err.Error())
+	if link, err = url.Parse(endpoint); err != nil {
+		return nil, fmt.Errorf("error: failure while parsing endpoint: %s. Error: %s",
+			endpoint, err.Error())
 	}
 
 	// Only http/https are supported schemes
@@ -95,27 +102,28 @@ func (p *proxy) parseEndpoint() error {
 
 	// Unknown schemes sometimes result in empty host value
 	if link.Host == "" {
-		return fmt.Errorf("error: empty host or protocol information in submitted endpoint (%s)",
-			p.endpoint)
+		return nil, fmt.Errorf("error: empty host or protocol information in submitted endpoint (%s)",
+			endpoint)
 	}
 
 	// AWS SignV4 enabled, extract required parts for signing process
-	if !p.nosignreq {
-		// Extract region and service from link
-		parts := strings.Split(link.Host, ".")
+	// Extract region and service from link
+	parts := strings.Split(link.Host, ".")
 
-		if len(parts) == 5 {
-			p.region, p.service = parts[1], parts[2]
-		} else {
-			return fmt.Errorf("error: submitted endpoint is not a valid Amazon ElasticSearch Endpoint")
-		}
+	// search-$es_domain.us-east-1.es.amazonaws.com
+	// https://search-domtest-doo7owbl6h26rve2aneagyhdzm.us-east-1.es.amazonaws.com/_plugin/kibana/
+
+	if len(parts) == 5 {
+		signingEnpoint.region, signingEnpoint.service = parts[1], parts[2]
+	} else {
+		return nil, fmt.Errorf("error: submitted endpoint is not a valid Amazon ElasticSearch Endpoint")
 	}
 
 	// Update proxy struct
-	p.scheme = link.Scheme
-	p.host = link.Host
+	signingEnpoint.scheme = link.Scheme
+	signingEnpoint.host = link.Host
 
-	return nil
+	return &signingEnpoint, nil
 }
 
 func (p *proxy) getSigner() *v4.Signer {
@@ -127,6 +135,16 @@ func (p *proxy) getSigner() *v4.Signer {
 		level.Info(logger).Log("msg", "session expired, generated fresh aws credentials object")
 	}
 	return v4.NewSigner(p.credentials)
+}
+
+func (p *proxy) getEndpointFromRequestHeader(r *http.Request) (*esSigningEndpoint, error) {
+
+	headerValue := r.Header.Get(p.endpointHeader)
+	if len(headerValue) > 0 {
+		r.Header.Del(p.endpointHeader)
+		return parseESEndpoint(headerValue)
+	}
+	return nil, fmt.Errorf("Request does not contain the ES Endpoint Header we are signing the request for: (%s)", p.endpointHeader)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -142,43 +160,46 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	ep := *r.URL
-	ep.Host = p.host
-	ep.Scheme = p.scheme
+	ep.Path = path.Clean(ep.Path)
 
-	req, err := http.NewRequest(r.Method, ep.String(), r.Body)
+	// Make signV4 optional
+	// Start AWS session from ENV, Shared Creds or EC2Role
+	signer := p.getSigner()
+	esEndpoint, err := p.getEndpointFromRequestHeader(r)
 
 	if err != nil {
-		level.Error(logger).Log("msg", "error creating new request. ", "err", err.Error())
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		level.Error(logger).Log("msg", "Error while parsing ES Endpoint header", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ep.Host = esEndpoint.host
+	ep.Scheme = esEndpoint.scheme
+
+	req, err := http.NewRequest(r.Method, ep.String(), r.Body)
+	if err != nil {
+		level.Error(logger).Log("msg", "BadGateway", "err", err.Error(), "request", req.URL.String())
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	addHeaders(r.Header, req.Header)
 
-	// Make signV4 optional
-	if !p.nosignreq {
-		// Start AWS session from ENV, Shared Creds or EC2Role
-		signer := p.getSigner()
-
-		// Sign the request with AWSv4
-		payload := bytes.NewReader(replaceBody(req))
-		signer.Sign(req, payload, p.service, p.region, time.Now())
-	}
+	// Sign the request with AWSv4
+	payload := bytes.NewReader(replaceBody(req))
+	signer.Sign(req, payload, esEndpoint.service, esEndpoint.region, time.Now())
 
 	resp, err := client.Do(req)
-
 	if err != nil {
 		level.Error(logger).Log("msg", "BadGateway", "err", err.Error(), "request", req.URL.String())
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if !p.nosignreq {
-		// AWS credentials expired, need to generate fresh ones
-		if resp.StatusCode == 403 {
-			p.credentials = nil
-			return
-		}
+	// AWS credentials expired, need to generate fresh ones
+	if resp.StatusCode == 403 {
+		p.credentials = nil
+		return
 	}
 
 	defer resp.Body.Close()
@@ -260,35 +281,29 @@ func init() {
 func main() {
 
 	var (
-		verbose       bool
-		prettify      bool
-		logtofile     bool
-		nosignreq     bool
-		endpoint      string
-		listenAddress string
-		fileRequest   *os.File
-		fileResponse  *os.File
-		err           error
+		verbose        bool
+		prettify       bool
+		logtofile      bool
+		endpointHeader string
+		listenAddress  string
+		fileRequest    *os.File
+		fileResponse   *os.File
+		err            error
 	)
 
-	flag.StringVar(&endpoint, "endpoint", "http://localhost", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
+	flag.StringVar(&endpointHeader, "endpoint-header", "X-ES-Endpoint", "The Header that contains Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
 	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
-	flag.BoolVar(&verbose, "verbose", true, "Print user requests")
-	flag.BoolVar(&nosignreq, "no-sign-reqs", false, "Disable AWS Signature v4")
+	flag.BoolVar(&verbose, "verbose", false, "Print user requests")
+	flag.BoolVar(&logtofile, "log-to-file", false, "Log user requests and ElasticSearch responses to files")
+	flag.BoolVar(&prettify, "pretty", false, "Prettify verbose and file output")
 	flag.Parse()
 
 	p := newProxy(
-		endpoint,
+		endpointHeader,
 		verbose,
 		prettify,
 		logtofile,
-		nosignreq,
 	)
-
-	if err = p.parseEndpoint(); err != nil {
-		level.Error(logger).Log("msg", err)
-		os.Exit(1)
-	}
 
 	if p.logtofile {
 		u1, _ := uuid.NewV4()

@@ -1,4 +1,6 @@
-# Mendeley changes
+# SDFE changes
+
+- Remove the setting of the Endpoint on command line, and instead use the HTTP header X-ES-Endpoint header
 
 ## Build
 
