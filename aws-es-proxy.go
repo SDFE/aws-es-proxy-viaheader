@@ -261,6 +261,17 @@ func addHeaders(src, dest http.Header) {
 	if val, ok := src["Authorization"]; ok {
 		dest.Add("Authorization", val[0])
 	}
+
+// Since AWS rebranded ES/Kibana to OpenSearch, they rebranded their headers as well
+// So we need these two osd headers instead of the above kbn headers to work on OpenSearch
+// Leaving the old ones for backwards compatibility
+	if val, ok := src["osd-version"]; ok {
+		dest.Add("osd-xsrf", val[0])
+	}
+
+	if val, ok := src["osd-xsrf"]; ok {
+		dest.Add("osd-xsrf", val[0])
+	}
 }
 
 // Signer.Sign requires a "seekable" body to sum body's sha256
