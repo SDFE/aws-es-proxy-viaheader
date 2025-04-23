@@ -1,5 +1,4 @@
 *~
 glide.lock
 dist
-aws-es-proxy
-aws-es-proxy-viaheader
+.idea

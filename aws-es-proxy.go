@@ -2,30 +2,56 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/aws/signer/v4"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-
-	uuid "github.com/satori/go.uuid"
+	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/sirupsen/logrus"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"golang.org/x/net/publicsuffix"
 )
 
-// set a default global logger
-var logger = log.NewJSONLogger(os.Stderr)
+func logger(debug bool) {
+
+	formatFilePath := func(path string) string {
+		arr := strings.Split(path, "/")
+		return arr[len(arr)-1]
+	}
+
+	if debug {
+		logrus.SetLevel(logrus.DebugLevel)
+		// logrus.SetReportCaller(true)
+	}
+
+	formatter := &logrus.TextFormatter{
+		TimestampFormat:        "2006-02-01 15:04:05",
+		FullTimestamp:          true,
+		DisableLevelTruncation: false,
+		CallerPrettyfier: func(f *runtime.Frame) (string, string) {
+			return "", fmt.Sprintf("%s:%d", formatFilePath(f.File), f.Line)
+		},
+	}
+	logrus.SetFormatter(formatter)
+}
 
 type requestStruct struct {
 	Requestid  string
@@ -44,60 +70,88 @@ type responseStruct struct {
 }
 
 type proxy struct {
-	scheme         string
-	host           string
-	region         string
-	service        string
-	endpointHeader string
-	verbose        bool
-	prettify       bool
-	logtofile      bool
-	fileRequest    *os.File
-	fileResponse   *os.File
-	credentials    *credentials.Credentials
-	client         *http.Client
+	scheme          string
+	host            string
+	region          string
+	service         string
+	endpointHeader  string
+	verbose         bool
+	prettify        bool
+	logtofile       bool
+	nosignreq       bool
+	fileRequest     *os.File
+	fileResponse    *os.File
+	credentials     *credentials.Credentials
+	httpClient      *http.Client
+	auth            bool
+	username        string
+	password        string
+	realm           string
+	remoteTerminate bool
+	assumeRole      string
 }
 
-func newProxy(args ...interface{}) *proxy {
-	return &proxy{
-		endpointHeader: args[0].(string),
-		verbose:        args[1].(bool),
-		prettify:       args[2].(bool),
-		logtofile:      args[3].(bool),
-	}
-}
-
-var client = &http.Client{
-	CheckRedirect: noRedirect,
-	Timeout:       300 * time.Second,
-}
-
-func noRedirect(req *http.Request, via []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
-type esSigningEndpoint struct {
+type esSigningEnpoint struct {
 	scheme  string
 	host    string
 	region  string
 	service string
 }
 
-func parseESEndpoint(endpoint string) (*esSigningEndpoint, error) {
-	var link *url.URL
-	var err error
-	signingEnpoint := esSigningEndpoint{}
+func newProxy(args ...interface{}) *proxy {
+
+	noRedirect := func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client := http.Client{
+		Timeout:       time.Duration(args[5].(int)) * time.Second,
+		CheckRedirect: noRedirect,
+		Jar:           jar,
+	}
+
+	return &proxy{
+		endpointHeader:  args[0].(string),
+		verbose:         args[1].(bool),
+		prettify:        args[2].(bool),
+		logtofile:       args[3].(bool),
+		nosignreq:       args[4].(bool),
+		httpClient:      &client,
+		auth:            args[6].(bool),
+		username:        args[7].(string),
+		password:        args[8].(string),
+		realm:           args[9].(string),
+		remoteTerminate: args[10].(bool),
+		assumeRole:      args[11].(string),
+	}
+}
+
+func parseESEndpoint(endpoint string) (*esSigningEnpoint, error) {
+	var (
+		link *url.URL
+		err  error
+	)
+
+	signingEndpoint := esSigningEnpoint{}
 
 	if link, err = url.Parse(endpoint); err != nil {
 		return nil, fmt.Errorf("error: failure while parsing endpoint: %s. Error: %s",
 			endpoint, err.Error())
 	}
 
-	// Only http/https are supported schemes
+	// Only http/https are supported schemes.
+	// AWS Elasticsearch uses https by default, but now aws-es-proxy
+	// allows non-aws ES clusters as endpoints, therefore we have to fallback
+	// to http instead of https
 	switch link.Scheme {
 	case "http", "https":
 	default:
-		link.Scheme = "https"
+		link.Scheme = "http"
 	}
 
 	// Unknown schemes sometimes result in empty host value
@@ -107,99 +161,158 @@ func parseESEndpoint(endpoint string) (*esSigningEndpoint, error) {
 	}
 
 	// AWS SignV4 enabled, extract required parts for signing process
-	// Extract region and service from link
-	parts := strings.Split(link.Host, ".")
+	split := strings.Split(link.Hostname(), ".")
+
+	if len(split) < 2 {
+		logrus.Debugln("Endpoint split is less than 2")
+	}
 
 	// search-$es_domain.us-east-1.es.amazonaws.com
 	// https://search-domtest-doo7owbl6h26rve2aneagyhdzm.us-east-1.es.amazonaws.com/_plugin/kibana/
-
-	if len(parts) == 5 {
-		signingEnpoint.region, signingEnpoint.service = parts[1], parts[2]
+	if len(split) == 5 {
+		signingEndpoint.region, signingEndpoint.service = split[1], split[2]
 	} else {
 		return nil, fmt.Errorf("error: submitted endpoint is not a valid Amazon ElasticSearch Endpoint")
 	}
 
 	// Update proxy struct
-	signingEnpoint.scheme = link.Scheme
-	signingEnpoint.host = link.Host
+	signingEndpoint.scheme = link.Scheme
+	signingEndpoint.host = link.Host
 
-	return &signingEnpoint, nil
+	return &signingEndpoint, nil
 }
 
 func (p *proxy) getSigner() *v4.Signer {
 	// Refresh credentials after expiration. Required for STS
 	if p.credentials == nil {
-		sess := session.Must(session.NewSession())
-		credentials := sess.Config.Credentials
-		p.credentials = credentials
-		level.Info(logger).Log("msg", "session expired, generated fresh aws credentials object")
+		sess, err := session.NewSession(
+			&aws.Config{
+				Region:                        aws.String(p.region),
+				CredentialsChainVerboseErrors: aws.Bool(true),
+			},
+		)
+		if err != nil {
+			logrus.Debugln(err)
+		}
+
+		awsRoleARN := os.Getenv("AWS_ROLE_ARN")
+		awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+
+		var creds *credentials.Credentials
+		if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
+			logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
+			creds = stscreds.NewWebIdentityCredentials(sess, awsRoleARN, "", awsWebIdentityTokenFile)
+		} else if p.assumeRole != "" {
+			logrus.Infof("Assuming credentials from %s", p.assumeRole)
+			creds = stscreds.NewCredentials(sess, p.assumeRole, func(provider *stscreds.AssumeRoleProvider) {
+				provider.Duration = 17 * time.Minute
+				provider.ExpiryWindow = 13 * time.Minute
+				provider.MaxJitterFrac = 0.1
+			})
+		} else {
+			logrus.Infoln("Using default credentials")
+			creds = sess.Config.Credentials
+		}
+
+		p.credentials = creds
+		logrus.Infoln("Generated fresh AWS Credentials object")
 	}
+
 	return v4.NewSigner(p.credentials)
 }
 
-func (p *proxy) getEndpointFromRequestHeader(r *http.Request) (*esSigningEndpoint, error) {
-
+func (p *proxy) getEndpointFromRequestHeader(r *http.Request) (*esSigningEnpoint, error) {
 	headerValue := r.Header.Get(p.endpointHeader)
 	if len(headerValue) > 0 {
 		r.Header.Del(p.endpointHeader)
 		return parseESEndpoint(headerValue)
 	}
-	return nil, fmt.Errorf("Request does not contain the ES Endpoint Header we are signing the request for: (%s)", p.endpointHeader)
+	return nil, fmt.Errorf(
+		"request does not contain the ES Endpoint Header we are signing the request for: (%s)",
+		p.endpointHeader)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	requestStarted := time.Now()
-	dump, err := httputil.DumpRequest(r, true)
+	if p.remoteTerminate && r.URL.Path == "/terminate-proxy" && r.Method == http.MethodPost {
+		logrus.Infoln("Terminate Signal")
+		os.Exit(0)
+	}
 
-	if err != nil {
-		level.Error(logger).Log("msg", "error while dumping request", "err", err.Error())
+	if p.auth {
+		user, pass, ok := r.BasicAuth()
+
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(p.username)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(p.password)) != 1 {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=\"%s\"", p.realm))
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte("Unauthorised.\n"))
+			return
+		}
+	}
+
+	requestStarted := time.Now()
+
+	var (
+		err  error
+		dump []byte
+	)
+
+	if dump, err = httputil.DumpRequest(r, true); err != nil {
+		logrus.WithError(err).Errorln("Failed to dump request.")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	defer r.Body.Close()
 
-	ep := *r.URL
-	ep.Path = path.Clean(ep.Path)
+	esEndpoint, err := p.getEndpointFromRequestHeader(r)
+	if err != nil {
+		logrus.WithError(err).Errorln("Failed to get ES Endpoint header.")
+	}
+
+	proxied := *r.URL
+	proxied.Host = esEndpoint.host
+	proxied.Scheme = esEndpoint.scheme
+	proxied.Path = path.Clean(proxied.Path)
+
+	req, err := http.NewRequest(r.Method, proxied.String(), r.Body)
 
 	// Make signV4 optional
 	// Start AWS session from ENV, Shared Creds or EC2Role
 	signer := p.getSigner()
-	esEndpoint, err := p.getEndpointFromRequestHeader(r)
-
-	if err != nil {
-		level.Error(logger).Log("msg", "Error while parsing ES Endpoint header", "err", err.Error())
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	ep.Host = esEndpoint.host
-	ep.Scheme = esEndpoint.scheme
-
-	req, err := http.NewRequest(r.Method, ep.String(), r.Body)
-	if err != nil {
-		level.Error(logger).Log("msg", "BadGateway", "err", err.Error(), "request", req.URL.String())
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 
 	addHeaders(r.Header, req.Header)
 
 	// Sign the request with AWSv4
 	payload := bytes.NewReader(replaceBody(req))
-	signer.Sign(req, payload, esEndpoint.service, esEndpoint.region, time.Now())
-
-	resp, err := client.Do(req)
+	_, err = signer.Sign(req, payload, esEndpoint.service, esEndpoint.region, time.Now())
 	if err != nil {
-		level.Error(logger).Log("msg", "BadGateway", "err", err.Error(), "request", req.URL.String())
+		p.credentials = nil
+		logrus.Errorln("Failed to sign", err)
+		http.Error(w, "Failed to sign", http.StatusForbidden)
+		return
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		logrus.Errorln(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	// AWS credentials expired, need to generate fresh ones
 	if resp.StatusCode == 403 {
+		logrus.Errorln("Received 403 from AWSAuth, invalidating credentials for retrial")
 		p.credentials = nil
-		return
+
+		logrus.Debugln("Received Status code from AWS:", resp.StatusCode)
+		b := bytes.Buffer{}
+		if _, err := io.Copy(&b, resp.Body); err != nil {
+			logrus.WithError(err).Errorln("Failed to decode body")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		logrus.Debugln("Received headers from AWS:", resp.Header)
+		logrus.Debugln("Received body from AWS:", string(b.Bytes()))
 	}
 
 	defer resp.Body.Close()
@@ -210,9 +323,11 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Send response back to requesting client
 	body := bytes.Buffer{}
 	if _, err := io.Copy(&body, resp.Body); err != nil {
-		level.Error(logger).Log("msg", "something went wrong", "err", err.Error())
+		logrus.Errorln(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body.Bytes())
 
@@ -237,17 +352,76 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if p.verbose {
-		level.Info(logger).Log("method", r.Method, "remoteAddress", r.RemoteAddr, "requestUri", ep.RequestURI(), "query", query, "status", resp.StatusCode, "timeElapsed", requestEnded.Seconds())
+		if p.prettify {
+			var prettyBody bytes.Buffer
+			json.Indent(&prettyBody, []byte(query), "", "  ")
+			t := time.Now()
+
+			fmt.Println()
+			fmt.Println("========================")
+			fmt.Println(t.Format("2006/01/02 15:04:05"))
+			fmt.Println("Remote Address: ", r.RemoteAddr)
+			fmt.Println("Request URI: ", proxied.RequestURI())
+			fmt.Println("Method: ", r.Method)
+			fmt.Println("Status: ", resp.StatusCode)
+			fmt.Printf("Took: %.3fs\n", requestEnded.Seconds())
+			fmt.Println("Body: ")
+			fmt.Println(string(prettyBody.Bytes()))
+		} else {
+			log.Printf(" -> %s; %s; %s; %s; %d; %.3fs\n",
+				r.Method, r.RemoteAddr,
+				proxied.RequestURI(), query,
+				resp.StatusCode, requestEnded.Seconds())
+		}
 	}
+
+	if p.logtofile {
+
+		requestID := primitive.NewObjectID().Hex()
+
+		reqStruct := &requestStruct{
+			Requestid:  requestID,
+			Datetime:   time.Now().Format("2006/01/02 15:04:05"),
+			Remoteaddr: r.RemoteAddr,
+			Requesturi: proxied.RequestURI(),
+			Method:     r.Method,
+			Statuscode: resp.StatusCode,
+			Elapsed:    requestEnded.Seconds(),
+			Body:       query,
+		}
+
+		respStruct := &responseStruct{
+			Requestid: requestID,
+			Body:      string(body.Bytes()),
+		}
+
+		y, _ := json.Marshal(reqStruct)
+		z, _ := json.Marshal(respStruct)
+		p.fileRequest.Write(y)
+		p.fileRequest.WriteString("\n")
+		p.fileResponse.Write(z)
+		p.fileResponse.WriteString("\n")
+
+	}
+
 }
 
 // Recent versions of ES/Kibana require
-// "kbn-version", "kbn-xsrf", "authorization" and "content-type: application/json"
+// "content-type: application/json" and
+// either "kbn-version" or "kbn-xsrf"
 // headers to exist in the request.
 // If missing requests fails.
 func addHeaders(src, dest http.Header) {
 	if val, ok := src["Kbn-Version"]; ok {
 		dest.Add("Kbn-Version", val[0])
+	}
+
+	if val, ok := src["Osd-Version"]; ok {
+		dest.Add("Osd-Version", val[0])
+	}
+
+	if val, ok := src["Osd-Xsrf"]; ok {
+		dest.Add("Osd-Xsrf", val[0])
 	}
 
 	if val, ok := src["Content-Type"]; ok {
@@ -260,17 +434,6 @@ func addHeaders(src, dest http.Header) {
 
 	if val, ok := src["Authorization"]; ok {
 		dest.Add("Authorization", val[0])
-	}
-
-// Since AWS rebranded ES/Kibana to OpenSearch, they rebranded their headers as well
-// So we need these two osd headers instead of the above kbn headers to work on OpenSearch
-// Leaving the old ones for backwards compatibility
-	if val, ok := src["Osd-Version"]; ok {
-		dest.Add("Osd-Version", val[0])
-	}
-
-	if val, ok := src["Osd-Xsrf"]; ok {
-		dest.Add("Osd-Xsrf", val[0])
 	}
 }
 
@@ -286,60 +449,102 @@ func replaceBody(req *http.Request) []byte {
 
 func copyHeaders(dst, src http.Header) {
 	for k, vals := range src {
-		for _, v := range vals {
-			dst.Add(k, v)
+		if k != "Authorization" {
+			for _, v := range vals {
+				dst.Add(k, v)
+			}
 		}
-	}
-}
 
-func init() {
-	// ensure global logger uses UTC timestamps
-	logger = log.With(logger, "timestamp", log.DefaultTimestampUTC)
+	}
 }
 
 func main() {
 
 	var (
-		verbose        bool
-		prettify       bool
-		logtofile      bool
-		endpointHeader string
-		listenAddress  string
-		fileRequest    *os.File
-		fileResponse   *os.File
-		err            error
+		debug           bool
+		auth            bool
+		username        string
+		password        string
+		realm           string
+		verbose         bool
+		prettify        bool
+		logtofile       bool
+		nosignreq       bool
+		ver             bool
+		endpointHeader  string
+		listenAddress   string
+		fileRequest     *os.File
+		fileResponse    *os.File
+		err             error
+		timeout         int
+		remoteTerminate bool
+		assumeRole      string
 	)
 
 	flag.StringVar(&endpointHeader, "endpoint-header", "X-ES-Endpoint", "The Header that contains Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
 	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
-	flag.BoolVar(&verbose, "verbose", false, "Print user requests")
+	flag.BoolVar(&verbose, "verbose", true, "Print user requests")
 	flag.BoolVar(&logtofile, "log-to-file", false, "Log user requests and ElasticSearch responses to files")
 	flag.BoolVar(&prettify, "pretty", false, "Prettify verbose and file output")
+	flag.BoolVar(&nosignreq, "no-sign-reqs", false, "Disable AWS Signature v4")
+	flag.BoolVar(&debug, "debug", true, "Print debug messages")
+	flag.BoolVar(&ver, "version", false, "Print aws-es-proxy version")
+	flag.IntVar(&timeout, "timeout", 15, "Set a request timeout to ES. Specify in seconds, defaults to 15")
+	flag.BoolVar(&auth, "auth", false, "Require HTTP Basic Auth")
+	flag.StringVar(&username, "username", "", "HTTP Basic Auth Username")
+	flag.StringVar(&password, "password", "", "HTTP Basic Auth Password")
+	flag.StringVar(&realm, "realm", "", "Authentication Required")
+	flag.BoolVar(&remoteTerminate, "remote-terminate", false, "Allow HTTP remote termination")
+	flag.StringVar(&assumeRole, "assume", "", "Optionally specify role to assume")
 	flag.Parse()
+
+	if debug {
+		logger(true)
+	} else {
+		logger(false)
+	}
+
+	if ver {
+		version := 1.5
+		logrus.Infof("Current version is: v%.1f", version)
+		os.Exit(0)
+	}
+
+	if auth {
+		if len(username) == 0 || len(password) == 0 {
+			fmt.Println("You need to specify username and password when using authentication.")
+			fmt.Println("Please run with '-h' for a list of available arguments.")
+			os.Exit(1)
+		}
+	}
 
 	p := newProxy(
 		endpointHeader,
 		verbose,
 		prettify,
 		logtofile,
+		nosignreq,
+		timeout,
+		auth,
+		username,
+		password,
+		realm,
+		remoteTerminate,
+		assumeRole,
 	)
 
 	if p.logtofile {
-		u1, _ := uuid.NewV4()
-		u2, _ := uuid.NewV4()
-		requestFname := fmt.Sprintf("request-%s.log", u1.String())
-		responseFname := fmt.Sprintf("response-%s.log", u2.String())
 
+		requestFname := fmt.Sprintf("request-%s.log", primitive.NewObjectID().Hex())
 		if fileRequest, err = os.Create(requestFname); err != nil {
-			level.Error(logger).Log("msg", err.Error())
-			os.Exit(1) // go-kit/log doesn't have a level.Fatal so we're exiting with os.Exit(1)
+			log.Fatalln(err.Error())
 		}
-		if fileResponse, err = os.Create(responseFname); err != nil {
-			level.Error(logger).Log("msg", err.Error())
-			os.Exit(1) // go-kit/log doesn't have a level.Fatal so we're exiting with os.Exit(1)
-		}
-
 		defer fileRequest.Close()
+
+		responseFname := fmt.Sprintf("response-%s.log", primitive.NewObjectID().Hex())
+		if fileResponse, err = os.Create(responseFname); err != nil {
+			log.Fatalln(err.Error())
+		}
 		defer fileResponse.Close()
 
 		p.fileRequest = fileRequest
@@ -347,8 +552,6 @@ func main() {
 
 	}
 
-	level.Info(logger).Log("status", "starting")
-	level.Info(logger).Log("status", "started", "listening", listenAddress)
-	level.Error(logger).Log("status", "failed", "err", http.ListenAndServe(listenAddress, p))
-
+	logrus.Infof("Listening on %s...\n", listenAddress)
+	logrus.Fatalln(http.ListenAndServe(listenAddress, p))
 }
