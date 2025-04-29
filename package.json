@@ -1,0 +1,9 @@
+{
+    "release": {
+      "branches": [
+        "SDPT-8183"
+      ]
+    },
+    "name": "aws-es-proxy-viaheader",
+    "private": true
+}
