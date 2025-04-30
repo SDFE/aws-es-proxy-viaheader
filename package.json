@@ -1,0 +1,9 @@
+{
+  "release": {
+    "branches": [
+      "main"
+    ]
+  },
+  "name": "aws-es-proxy-viaheader",
+  "private": true
+}

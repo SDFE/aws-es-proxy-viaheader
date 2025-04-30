@@ -2,21 +2,9 @@
 
 - Remove the setting of the Endpoint on command line, and instead use the HTTP header X-ES-Endpoint header
 
-## Build
-
-see: [BUILD.md](BUILD.md)
-
-## Logging
-
-- removed log to file
-- now using `go-kit` for logging with levels
-
-## Redirects
-
-- implemented changes from PR (https://github.com/abutaha/aws-es-proxy/pull/31)
-
-
 # aws-es-proxy
+
+[![Docker Pulls](https://img.shields.io/docker/pulls/abutaha/aws-es-proxy.svg)](https://hub.docker.com/r/abutaha/aws-es-proxy/)
 
 **aws-es-proxy** is a small web server application sitting between your HTTP client (browser, curl, etc...) and Amazon Elasticsearch service. It will sign your requests using latest [AWS Signature Version 4](http://docs.aws.amazon.com/general/latest/gr/signature-version-4.html) before sending the request to Amazon Elasticsearch. When response is back from Amazon Elasticsearch, this response will be sent back to your HTTP client.
 
@@ -30,28 +18,36 @@ Kibana requests are also signed automatically.
 
 Download the latest [aws-es-proxy release](https://github.com/abutaha/aws-es-proxy/releases/).
 
+### Docker
+
+There is an official docker image available for aws-es-proxy. To run the image:
+
+```sh
+# v0.9 and newer (latest always point to the latest release):
+
+docker run --rm -v ~/.aws:/root/.aws -p 9200:9200 abutaha/aws-es-proxy:v1.0 -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com -listen 0.0.0.0:9200
+
+v.08:
+
+docker run --rm -it abutaha/aws-es-proxy ./aws-es-proxy -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com
+
+```
+
+To expose a port number other than the default 9200, pass an environment variable of `PORT_NUM` to docker with the port number you wish to expose for your service.
+
 ### Via homebrew
 
 ```sh
 brew install aws-es-proxy
 ```
 
-
 ### Build from Source
 
 #### Dependencies:
-* go1.5+
-* [glide package manager](https://github.com/Masterminds/glide)
-
+* go1.14+
 
 ```sh
-#requires go1.5
-export GO15VENDOREXPERIMENT=1
-mkdir -p $GOPATH/src/github.com/abutaha
-cd $GOPATH/src/github.com/abutaha
-git clone https://github.com/abutaha/aws-es-proxy
-cd aws-es-proxy
-glide install
+#requires go1.14
 go build github.com/abutaha/aws-es-proxy
 ```
 
@@ -94,9 +90,18 @@ export AWS_SECRET_ACCESS_KEY=MY-SECRET-KEY
 
 ## Usage example:
 
+You can use either argument `-endpoint` OR environment variable `ENDPOINT` to specify AWS ElasticSearch endpoint.
+
 ```sh
 ./aws-es-proxy -endpoint https://test-es-somerandomvalue.eu-west-1.es.amazonaws.com
 Listening on 127.0.0.1:9200
+```
+
+```sh
+export ENDPOINT=https://test-es-somerandomvalue.eu-west-1.es.amazonaws.com
+
+./aws-es-proxy  -listen 10.0.0.1:9200 -verbose
+Listening on 10.0.0.1:9200
 ```
 
 *aws-es-proxy* listens on 127.0.0.1:9200 if no additional argument is provided. You can change the IP and Port passing the argument `-listen`
@@ -123,6 +128,10 @@ For a full list of available options, use `-h`:
 ```sh
 ./aws-es-proxy -h
 Usage of ./aws-es-proxy:
+  -auth
+        Require HTTP Basic Auth
+  -debug
+        Print debug messages
   -endpoint string
         Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)
   -listen string
@@ -131,28 +140,33 @@ Usage of ./aws-es-proxy:
         Log user requests and ElasticSearch responses to files
   -no-sign-reqs
         Disable AWS Signature v4
+  -password string
+        HTTP Basic Auth Password
   -pretty
         Prettify verbose and file output
+  -realm string
+        Authentication Required
+  -remote-terminate
+        Allow HTTP remote termination
+  -timeout int
+        Set a request timeout to ES. Specify in seconds, defaults to 15 (default 15)
+  -username string
+        HTTP Basic Auth Username
   -verbose
         Print user requests
+  -version
+        Print aws-es-proxy version
 ```
 
-## Docker
-
-There is an official docker image avaiable for aws-es-proxy. To run the image:
-
-```sh
-# Prints usage info (-h)
-docker run --rm -it abutaha/aws-es-proxy
-
-# Runs with custom command/args
-docker run --rm -it abutaha/aws-es-proxy ./aws-es-proxy -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com
-```
-
-To expose a port number other than the default 9200, pass an environment variable of `PORT_NUM` to docker with the port number you wish to expose for your service.
 
 ## Using HTTP Clients
 
 After you run *aws-es-proxy*, you can now open your Web browser on [http://localhost:9200](http://localhost:9200). Everything should be working as you have your own instance of ElasticSearch running on port 9200.
 
-To access Kibana, use [http://localhost:9200/_plugin/kibana/](http://localhost:9200/_plugin/kibana/)
+To access Kibana, use [http://localhost:9200/_plugin/kibana/app/kibana](http://localhost:9200/_plugin/kibana/app/kibana)
+
+## Pre-commit
+Install with:
+```bash
+pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
+```

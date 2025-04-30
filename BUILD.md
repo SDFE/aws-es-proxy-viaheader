@@ -3,10 +3,7 @@
 ***Note**: versioned dependencies has been removed for simplicity, once we have some experience with vgo & co. we will be adding versioned dependencies back in, however, for now this is sufficient and as of 30/8/2018 the build works*
 
 ### requirements
-- go 1.10
-
-### known issues
-- go 1.11 seems to make the http client `panic` when trying to connect to a endpoint that doesn't exist or the endpoint doesn't listen on that port
+- go 1.20
 
 ### build it
 
