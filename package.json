@@ -1,7 +1,7 @@
 {
   "release": {
     "branches": [
-      "main"
+      "master"
     ]
   },
   "name": "aws-es-proxy-viaheader",
