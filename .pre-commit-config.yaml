@@ -1,0 +1,12 @@
+repos:
+  - repo: git@github.com:SDFE/sd-precommit.git
+    rev: v1.2.4
+    hooks:
+      - id: sd-hooks
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.8.2
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+      - id: commitizen-branch
+        stages: [pre-push]
