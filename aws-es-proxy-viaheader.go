@@ -352,6 +352,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if p.verbose {
+		sanitizedRequestURI := strings.ReplaceAll(proxied.RequestURI(), "\n", "")
+		sanitizedRequestURI = strings.ReplaceAll(sanitizedRequestURI, "\r", "")
 		if p.prettify {
 			var prettyBody bytes.Buffer
 			json.Indent(&prettyBody, []byte(query), "", "  ")
@@ -361,15 +363,13 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Println("========================")
 			fmt.Println(t.Format("2006/01/02 15:04:05"))
 			fmt.Println("Remote Address: ", r.RemoteAddr)
-			fmt.Println("Request URI: ", proxied.RequestURI())
+			fmt.Println("Request URI: ", sanitizedRequestURI)
 			fmt.Println("Method: ", r.Method)
 			fmt.Println("Status: ", resp.StatusCode)
 			fmt.Printf("Took: %.3fs\n", requestEnded.Seconds())
 			fmt.Println("Body: ")
 			fmt.Println(string(prettyBody.Bytes()))
 		} else {
-			sanitizedRequestURI := strings.ReplaceAll(proxied.RequestURI(), "\n", "")
-			sanitizedRequestURI = strings.ReplaceAll(sanitizedRequestURI, "\r", "")
 			log.Printf(" -> %s; %s; %s; %s; %d; %.3fs\n",
 				r.Method, r.RemoteAddr,
 				sanitizedRequestURI, query,
