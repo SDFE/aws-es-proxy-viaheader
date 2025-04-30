@@ -266,7 +266,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	esEndpoint, err := p.getEndpointFromRequestHeader(r)
 	if err != nil {
-		logrus.WithError(err).Errorln("Failed to get ES Endpoint header.")
+		logrus.Errorln("Failed to get ES Endpoint header.")
 	}
 
 	proxied := *r.URL
@@ -368,9 +368,11 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Println("Body: ")
 			fmt.Println(string(prettyBody.Bytes()))
 		} else {
+			sanitizedRequestURI := strings.ReplaceAll(proxied.RequestURI(), "\n", "")
+			sanitizedRequestURI = strings.ReplaceAll(sanitizedRequestURI, "\r", "")
 			log.Printf(" -> %s; %s; %s; %s; %d; %.3fs\n",
 				r.Method, r.RemoteAddr,
-				proxied.RequestURI(), query,
+				sanitizedRequestURI, query,
 				resp.StatusCode, requestEnded.Seconds())
 		}
 	}

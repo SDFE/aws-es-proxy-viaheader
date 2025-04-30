@@ -1,7 +1,7 @@
 {
     "release": {
       "branches": [
-        "SDPT-8183"
+        "main"
       ]
     },
     "name": "aws-es-proxy-viaheader",
