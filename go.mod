@@ -1,6 +1,6 @@
 module github.com/abutaha/aws-es-proxy
 
-go 1.23.1
+go 1.24.2
 
 require (
 	github.com/aws/aws-sdk-go v1.44.215
